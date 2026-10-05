@@ -209,7 +209,9 @@ class AcceleratorFactory:
             elif connection_type == "bus":
                 # Connect cores to bus, edge by edge
                 # Make sure all links refer to the same `CommunicationLink` instance
-                bus_instance = CommunicationLink("Any", "Any", bw, uec, bidirectional=True)
+                bus_instance = CommunicationLink(
+                    "Any", "Any", bw, uec, bidirectional=True, members=tuple(connection["cores"])
+                )
                 pairs_this_connection = [(a, b) for idx, a in enumerate(core_objs) for b in core_objs[idx + 1 :]]
                 for core_a, core_b in pairs_this_connection:
                     edges += get_bidirectional_edges(
@@ -224,4 +226,9 @@ class AcceleratorFactory:
                 raise ValueError(
                     f"Invalid connection type '{connection_type}' for connection {core_objs}. Expected 'link' or 'bus'."
                 )
-        return CoreGraph(edges)
+        # A graph holds one edge per core pair, so where connections overlap a pair takes its widest.
+        widest: dict[tuple[Core, Core], dict[str, CommunicationLink]] = {}
+        for core_a, core_b, data in edges:
+            if (core_a, core_b) not in widest or data["cl"].bandwidth >= widest[(core_a, core_b)]["cl"].bandwidth:
+                widest[(core_a, core_b)] = data
+        return CoreGraph([(core_a, core_b, data) for (core_a, core_b), data in widest.items()])

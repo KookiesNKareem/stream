@@ -168,8 +168,8 @@ def _shared_rows(alloc: TransferAndTensorAllocator, q: QuantityRegistry, interva
 def _link_rows(alloc: TransferAndTensorAllocator, interval: float) -> list[dict[str, Any]]:
     bits: dict[Any, float] = defaultdict(float)
     for stream, stream_bits in _stream_bits(alloc):
-        for link in stream.choice.links_used:
-            bits[link] += stream_bits
+        for link, share in zip(stream.choice.links_used, stream.choice.link_shares(), strict=True):
+            bits[link] += stream_bits * share
     return [
         _activity_row(alloc, "link", _link_name(link), _link_cores(link), link.bandwidth, b, interval)
         for link, b in bits.items()

@@ -13,7 +13,9 @@ def get_bidirectional_edges(
     bus_instance: "CommunicationLink | None" = None,
 ) -> list[tuple["Core", "Core", dict[str, "CommunicationLink"]]]:
     """Create a list with two edges: from A to B and B to A."""
-    bus = bus_instance or CommunicationLink("Any", "Any", bandwidth, unit_energy_cost, bidirectional=True)
+    bus = bus_instance or CommunicationLink(
+        "Any", "Any", bandwidth, unit_energy_cost, bidirectional=True, members=(core_a.id, core_b.id)
+    )
     link_a_to_b = CommunicationLink(core_a, core_b, bandwidth, unit_energy_cost)
     link_b_to_a = CommunicationLink(core_b, core_a, bandwidth, unit_energy_cost)
 
@@ -43,16 +45,22 @@ class CommunicationLink:
         bandwidth: int | float,
         unit_energy_cost: float,
         bidirectional: bool = False,
+        members: tuple[int, ...] = (),
     ) -> None:
         self.sender = sender
         self.receiver = receiver
         self.bandwidth = bandwidth
         self.unit_energy_cost = unit_energy_cost
         self.bidirectional = bidirectional  # TODO this property is not in use?
-        self._hash = hash((self.sender, self.receiver, self.bandwidth, self.unit_energy_cost, self.bidirectional))
+        # A bus has no endpoints, so the cores it joins tell two buses of one bandwidth apart.
+        self.members = tuple(sorted(members))
+        self._hash = hash(
+            (self.sender, self.receiver, self.bandwidth, self.unit_energy_cost, self.bidirectional, self.members)
+        )
 
     def __str__(self) -> str:
-        return f"CL({self.sender}, {self.receiver}, bw={self.bandwidth})"
+        ends = f"bus{list(self.members)}" if self.members else f"{self.sender}, {self.receiver}"
+        return f"CL({ends}, bw={self.bandwidth})"
 
     def __repr__(self) -> str:
         return str(self)
@@ -61,10 +69,11 @@ class CommunicationLink:
         return self._hash
 
     def __eq__(self, other: object) -> bool:
-        return isinstance(other, CommunicationLink) and (self.sender, self.receiver, self.bandwidth) == (
+        return isinstance(other, CommunicationLink) and (self.sender, self.receiver, self.bandwidth, self.members) == (
             other.sender,
             other.receiver,
             other.bandwidth,
+            other.members,
         )
 
     def __lt__(self, other: object) -> bool:

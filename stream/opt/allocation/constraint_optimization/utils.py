@@ -9,17 +9,17 @@ from stream.workload.workload import ComputationNode
 def get_transfer_latency_for_path(tr: TransferNode, path: MulticastPathPlan) -> int:
     """Cycles one firing of this transfer costs on this path.
 
-    The bytes over the narrowest link, spread over the chains that carry them: sources and
-    targets that pair up one to one take a slice each over disjoint chains and move at once,
-    where a transfer that fans out of or into a single core shares that core's link.
+    The slices move at once, so the busiest link sets the time: each link carries the slices of
+    the chains that cross it.
     """
     if not path or not path.links_used:
         return 0
-    min_bw = min(link.bandwidth for link in path.links_used)
     assert len(tr.inputs) == 1, "Only single-input transfers are supported for latency calculation."
-    tensor = tr.inputs[0]
-    chains = len(path.targets) if 1 < len(path.sources) == len(path.targets) else 1
-    return ceil(tensor.size_bits() / (min_bw * chains))
+    bits = tr.inputs[0].size_bits()
+    link_chains = path.link_chains or (path.chains,) * len(path.links_used)
+    return max(
+        ceil(bits * n / (link.bandwidth * path.chains)) for link, n in zip(path.links_used, link_chains, strict=True)
+    )
 
 
 def get_active_transfer_latency_for_path(tr: TransferNode, choice: MulticastPathPlan, reuse_factor, ssis) -> int:

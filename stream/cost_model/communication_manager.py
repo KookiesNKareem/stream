@@ -129,6 +129,32 @@ class MulticastPathPlan:
     targets: tuple["Core", ...]
     total_hops_objective: int  # objective used to rank meetings
     links_used: tuple["CommunicationLink", ...]
+    # The tensor splits evenly over ``chains`` disjoint slices; ``link_chains[i]`` of them cross ``links_used[i]``.
+    chains: int = 1
+    link_chains: tuple[int, ...] = ()
+
+    def link_shares(self) -> tuple[float, ...]:
+        """Fraction of the tensor each link in ``links_used`` carries."""
+        if not self.link_chains:
+            return (1.0,) * len(self.links_used)
+        return tuple(n / self.chains for n in self.link_chains)
+
+
+def pair_chains(sources: tuple["Core", ...], targets: tuple["Core", ...]) -> list[list[tuple["Core", "Core"]]]:
+    """The (source, target) pairs each slice of a transfer travels, one list per slice.
+
+    Allocation position is spatial index, so when one side's count divides the other's, each core on
+    the smaller side exchanges its slice with a contiguous block of the larger side only. Otherwise
+    every source reaches every target in one chain.
+    """
+    k, n = len(sources), len(targets)
+    if k > 1 and n % k == 0:
+        g = n // k
+        return [[(s, t) for t in targets[i * g : (i + 1) * g]] for i, s in enumerate(sources)]
+    if n > 1 and k % n == 0:
+        g = k // n
+        return [[(s, t) for s in sources[j * g : (j + 1) * g]] for j, t in enumerate(targets)]
+    return [[(s, t) for s in sources for t in targets]]
 
 
 class CommunicationManager:
@@ -220,7 +246,7 @@ class CommunicationManager:
         """
         No-meeting enumeration that covers ALL sources and ALL destinations together.
 
-        We construct a plan by choosing one path per (source,target) pair (default: all pairs),
+        We construct a plan by choosing one path per (source,target) pair of :func:`pair_chains`,
         then taking the union of edges (CommunicationLinks) used by those paths.
 
         Enumeration:
@@ -233,9 +259,9 @@ class CommunicationManager:
 
         Gw, edge_w, edge_index, index_w, kpath_cache = self._route_state(offchip_mem_penalty)
 
-        # Define the required connectivity.
-        # Default: all-pairs coverage (each source can reach each destination).
-        pairs: list[tuple[Core, Core]] = [(s, t) for s in sources for t in targets]
+        chains = pair_chains(sources, targets)
+        chain_of = {pair: c for c, chain in enumerate(chains) for pair in chain}
+        pairs: list[tuple[Core, Core]] = list(chain_of)
 
         # Build path options for each pair.
         pair_options: dict[tuple[Core, Core], list[list[Core]]] = {}
@@ -289,20 +315,19 @@ class CommunicationManager:
                 continue
             seen_edge_sets.add(st.edges)
 
-            # Add the links used for this plan
-            links_used: list[CommunicationLink] = list()
-            for path in st.full_paths.values():
+            link_chains: dict[CommunicationLink, set[int]] = {}
+            for pair, path in st.full_paths.items():
                 for u, v in zip(path, path[1:], strict=False):
-                    cl = self.accelerator.cores.edges[(u, v)]["cl"]
-                    if cl not in links_used:
-                        links_used.append(cl)
+                    link_chains.setdefault(self.accelerator.cores.edges[(u, v)]["cl"], set()).add(chain_of[pair])
 
             plans.append(
                 MulticastPathPlan(
                     sources=tuple(sources),
                     targets=tuple(targets),
                     total_hops_objective=st.score,
-                    links_used=tuple(links_used),
+                    links_used=tuple(link_chains),
+                    chains=len(chains),
+                    link_chains=tuple(len(c) for c in link_chains.values()),
                 )
             )
             if len(plans) >= max_allocations:
