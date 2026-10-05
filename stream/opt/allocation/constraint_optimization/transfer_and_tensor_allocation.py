@@ -204,6 +204,7 @@ class TransferAndTensorAllocator:
         # primary decision vars
         self.x_tensor_choice: dict[tuple[Tensor, TensorPlacementChoice], SolverVar] = {}
         self.y_path_choice: dict[tuple[TransferNode, MulticastPathPlan], SolverVar] = {}
+        self.path_choice_name: dict[tuple[TransferNode, MulticastPathPlan], str] = {}
 
         # auxiliary indicators
         self._handover_bits: dict[int, int] = {}
@@ -212,8 +213,9 @@ class TransferAndTensorAllocator:
         self.same_core_indicator: dict[tuple[Tensor, Tensor, Core], SolverVar] = {}
 
         # helpers
-        self.link_set: set[CommunicationLink] = set()
-        self.links_in_choice: dict[tuple[TransferNode, MulticastPathPlan], set[CommunicationLink]] = {}
+        # Insertion-ordered sets: link hashes are seed-dependent, and their order shapes the model.
+        self.link_set: dict[CommunicationLink, None] = {}
+        self.links_in_choice: dict[tuple[TransferNode, MulticastPathPlan], dict[CommunicationLink, None]] = {}
         self.choice_src_cores: dict[tuple[TransferNode, MulticastPathPlan], set[Core]] = {}
         self.choice_dst_cores: dict[tuple[TransferNode, MulticastPathPlan], set[Core]] = {}
         self.choice_mem_cores: dict[tuple[TransferNode, MulticastPathPlan], set[Core]] = {}
@@ -668,7 +670,7 @@ class TransferAndTensorAllocator:
             for choice in self.possible_transfer_allocations[tr]:
                 key = (tr, choice)
                 # Data handed over within one memory crosses no link.
-                self.links_in_choice[key] = set() if self._in_one_memory(choice) else self._links_of_choice(choice)
+                self.links_in_choice[key] = {} if self._in_one_memory(choice) else self._links_of_choice(choice)
                 self.link_set.update(self.links_in_choice[key])
                 self.choice_src_cores[key] = self._src_cores_of_choice(choice)
                 self.choice_dst_cores[key] = self._dst_cores_of_choice(choice)
@@ -676,8 +678,8 @@ class TransferAndTensorAllocator:
                 self.choice_has_empty_path[key] = len(choice.links_used) == 0
 
     @staticmethod
-    def _links_of_choice(choice: MulticastPathPlan) -> set[CommunicationLink]:
-        return set(choice.links_used)
+    def _links_of_choice(choice: MulticastPathPlan) -> dict[CommunicationLink, None]:
+        return dict.fromkeys(choice.links_used)
 
     @staticmethod
     def _src_cores_of_choice(choice: MulticastPathPlan) -> set[Core]:
@@ -895,6 +897,7 @@ class TransferAndTensorAllocator:
     def __create_transfer_path_vars(self):
         for tr in self.transfer_nodes:
             for i, choice in enumerate(self.possible_transfer_allocations[tr]):
+                self.path_choice_name[(tr, choice)] = f"{tr.name}_choice_{i}"
                 v = self.model.add_var(vtype=SolverVarType.BINARY, name=f"y_{tr.name}_choice_{i}")
                 self.y_path_choice[(tr, choice)] = v
 
@@ -1412,7 +1415,9 @@ class TransferAndTensorAllocator:
         for (tr, choice), y in self.y_path_choice.items():
             s = self.slot_of[tr]
             active_latency = self._active_transfer_latency(tr, choice, y)
-            self.model.add_constr(self.slot_latency[s] >= active_latency, name=f"tr_lat_{tr.name}_{hash(choice)}")
+            self.model.add_constr(
+                self.slot_latency[s] >= active_latency, name=f"tr_lat_{self.path_choice_name[(tr, choice)]}"
+            )
 
     def _force_nonconstant_reuse_levels(self):
         """
@@ -1476,6 +1481,7 @@ class TransferAndTensorAllocator:
             t = tr.outputs[0]
             if t not in self.tensors_to_optimize_reuse_for:
                 continue
+            choice_name = self.path_choice_name[(tr, choice)]
             sizes = self.ssis[t].get_applicable_temporal_sizes()
             # (tiles a run waits for, the choice that makes it wait, its name)
             whole = (
@@ -1489,7 +1495,7 @@ class TransferAndTensorAllocator:
             )
             choices = whole + [(prod(sizes[s + 1 :]), single, f"single_L{s}") for s, single in singles[t]]
             held = [
-                (tiles, self._add_binary_product(a=y, b=z, base_name=f"fill_{tr.name}_{hash(choice)}_{name}"))
+                (tiles, self._add_binary_product(a=y, b=z, base_name=f"fill_{choice_name}_{name}"))
                 for tiles, z, name in choices
             ]
             if not held:
@@ -1497,7 +1503,7 @@ class TransferAndTensorAllocator:
             cycles = self.transfer_latency_for_path(tr, choice)
             self.model.add_constr(
                 fill >= self.model.quicksum(tiles * cycles * w._raw for tiles, w in held),
-                name=f"fill_{tr.name}_{hash(choice)}",
+                name=f"fill_{choice_name}",
             )
             for core_id, model in self.shared_bandwidth.items():
                 share = self._shared_cycles(core_id, tr, choice, model.ceiling)
@@ -1634,7 +1640,7 @@ class TransferAndTensorAllocator:
                 slot_latency_ub = max(slot_latency_ub, lat)
         slot_latency_ub = max(slot_latency_ub, self._family_slot_pressure_bound())
 
-        for res in {r for r, _ in self.idle_ind}:
+        for res in dict.fromkeys(r for r, _ in self.idle_ind):
             terms = []
             for s in range(max_s + 1):
                 for i, ind in enumerate(self.idle_ind.get((res, s), ())):
@@ -1701,7 +1707,7 @@ class TransferAndTensorAllocator:
                     latency = self._active_transfer_latency(tr, choice, y)
                     self.model.add_constr(
                         overlap <= iteration - busy - (1.0 - fraction) * latency._raw,
-                        name=f"skip_floor_{n.name}_{_resource_key(core)}_{tr.name}_{hash(choice)}",
+                        name=f"skip_floor_{n.name}_{_resource_key(core)}_{self.path_choice_name[(tr, choice)]}",
                     )
 
     def _link_busy_expr(self, link: CommunicationLink):

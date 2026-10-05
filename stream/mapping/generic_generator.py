@@ -514,7 +514,7 @@ class GenericMappingGenerator:
                 "softmax": softmax_axes.get(dim, False),
                 "state": dim in state_axes,
             }
-            for dim in sorted(all_axes, key=sub_workload.get_dimension_size, reverse=True)
+            for dim in sorted(all_axes, key=lambda d: (-sub_workload.get_dimension_size(d), d.position))
         ]
 
     def _fusible_parallel_dims(self, sub_workload: Workload, cns: tuple[ComputationNode, ...]) -> set[LayerDim]:
