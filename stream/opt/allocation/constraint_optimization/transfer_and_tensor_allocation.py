@@ -200,6 +200,11 @@ class TransferAndTensorAllocator:
         # core id -> [(indicator, bits-when-1, tensor)]: terms of that core's memory-capacity constraint.
         self._memory_load_terms: dict[int, list[tuple[SolverVar, int, str]]] = defaultdict(list)
         self._capacity_load_terms: dict[tuple[str, int], list[tuple[SolverVar, int]]] = defaultdict(list)
+        # (memory id, tensor) -> per holder, its fewest resident bits at each reuse level from -1 up; and
+        # tensor -> the lowest reuse level a force_*_reuse constraint lets it take. The diagnosis floors a
+        # tensor's demand at that level, where a pinned output's residency is what overflows.
+        self._least_bits_by_level: dict[tuple[int, str], list[list[int]]] = defaultdict(list)
+        self._reuse_floors: dict[str, int] = {}
 
         # primary decision vars
         self.x_tensor_choice: dict[tuple[Tensor, TensorPlacementChoice], SolverVar] = {}
@@ -1151,11 +1156,14 @@ class TransferAndTensorAllocator:
                 least_bytes: dict[Core, float] = defaultdict(float)
                 for memory, holder, u in holders:
                     min_req: int | None = None
+                    by_level = self._least_bits_by_level[(memory.id, t.name)]
+                    by_level.append([])
                     for stop in range(-1, len(self.ssis[t].get_applicable_temporal_variables())):
                         req_size = ceil(self._resident_tiles(t, stop) * tensor_size)
                         single = (t, stop) in self.z_single
                         least = ceil(self._resident_tiles(t, stop, single) * tensor_size)
                         min_req = least if min_req is None else min(min_req, least)
+                        by_level[-1].append(least)
                         uz = self._add_binary_product(
                             a=u,
                             b=self.z_stop[(t, stop)],
@@ -1434,6 +1442,7 @@ class TransferAndTensorAllocator:
                     if r is False:
                         last_irrelevant = i
                 if last_irrelevant >= 0:
+                    self._reuse_floors[t.name] = max(self._reuse_floors.get(t.name, -1), last_irrelevant)
                     self.model.add_constr(
                         self.model.quicksum(self.z_stop[(t, s)]._raw for s in range(last_irrelevant, len(relevancies)))
                         >= 1,
@@ -1455,6 +1464,7 @@ class TransferAndTensorAllocator:
                     if r is False:
                         last_irrelevant = i
                 if last_irrelevant >= 0:
+                    self._reuse_floors[t.name] = max(self._reuse_floors.get(t.name, -1), last_irrelevant)
                     self.model.add_constr(
                         self.model.quicksum(self.z_stop[(t, s)]._raw for s in range(last_irrelevant, len(relevancies)))
                         >= 1,
@@ -2116,7 +2126,7 @@ class TransferAndTensorAllocator:
                 ConstraintTermIR(
                     label=label,
                     value=self._term_value(info),
-                    detail=meta["term_detail"],
+                    detail=info.get("detail", meta["term_detail"]) if isinstance(info, dict) else meta["term_detail"],
                     dtype=dtype,
                     dims=[TileDimIR(label=lbl, size=sz) for lbl, sz in dims],
                 )
@@ -2140,13 +2150,29 @@ class TransferAndTensorAllocator:
             levers=[lever.format(core=core) for lever in meta["levers"]],
         )
 
+    def _floored_terms(self, family: str, core_id: int) -> dict[str, Any]:
+        """A family+core's recorded demand terms, each pinned tensor's raised to its least residency at the
+        reuse level its force_*_reuse constraint requires (only memory records residency per level)."""
+        terms = dict(self._resource_terms.get((family, core_id), {}))
+        if family != "memory_capacity":
+            return terms
+        for name, info in terms.items():
+            floor = self._reuse_floors.get(name)
+            holders = self._least_bits_by_level.get((core_id, name))
+            if floor is None or not holders or not isinstance(info, dict):
+                continue
+            value = sum(min(levels[floor + 1 :], default=0) for levels in holders) / 8
+            if value > info["value"]:
+                terms[name] = {**info, "value": value, "detail": "pinned resident across its unindexed loops"}
+        return terms
+
     def _build_unmet_direct(self, family: str, core_id: int) -> UnmetConstraintIR | None:
         """The unmet inequality from *all* recorded demand terms for a family+core, with no IIS
         filtering -- how the backend-agnostic fallback quantifies an over-budget resource."""
-        terms_all = self._resource_terms.get((family, core_id))
+        terms_all = self._floored_terms(family, core_id)
         if not terms_all:
             return None
-        return self._unmet_from_terms(family, core_id, dict(terms_all))
+        return self._unmet_from_terms(family, core_id, terms_all)
 
     def _direct_capacity_overflows(self) -> list[ImplicatedResourceIR]:
         """Backend-agnostic infeasibility diagnosis: when the solver reports no IIS (e.g. OR-Tools), a
@@ -2159,11 +2185,11 @@ class TransferAndTensorAllocator:
             res.id: res for _k, res in self._constraint_resources.values() if isinstance(res, Core)
         }
         overflows: list[tuple[float, str, int]] = []
-        for (family, core_id), terms in self._resource_terms.items():
+        for family, core_id in self._resource_terms:
             bound = self._resource_bounds.get((family, core_id))
             if not bound or bound <= 0:
                 continue
-            demand = sum(self._term_value(v) for v in terms.values())
+            demand = sum(self._term_value(v) for v in self._floored_terms(family, core_id).values())
             if demand > bound:
                 overflows.append((demand - bound, family, core_id))
         overflows.sort(reverse=True)  # biggest overshoot first, so the worst offender leads the report
@@ -2345,9 +2371,10 @@ class TransferAndTensorAllocator:
         elif not iis_available:
             nature = "unknown"
             summary = (
-                f"Infeasible mapping ({status}); no single per-core capacity is over its recorded budget, "
-                f"so the conflict is structural (e.g. transfer routing). The {stats.backend} backend cannot "
-                "compute an IIS -- re-run with the Gurobi backend for the minimal conflict set."
+                f"Infeasible mapping ({status}); no single per-core capacity is over budget at its tensors' "
+                "least residency, so the conflict spans constraints (e.g. capacity shared across cores, "
+                f"transfer routing). The {stats.backend} backend cannot compute an IIS -- re-run with the "
+                "Gurobi backend for the minimal conflict set."
             )
         else:
             nature = "unknown"

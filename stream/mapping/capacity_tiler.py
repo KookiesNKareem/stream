@@ -69,8 +69,14 @@ class CapacityTiler:
         core_cap: dict[int, int] = {}
         core_tensors: dict[int, list[tuple[Tensor, frozenset[LayerDim]]]] = {}
         core_seen: dict[int, set[str]] = {}
+        # Per output tensor: its producer's dims that do not index it (the loops it is never spilled across).
+        unindexed: dict[str, frozenset[LayerDim]] = {}
         for cn in cns:
             node_tensors = self._node_tensors(cn)
+            outputs = {t.name for t in cn.outputs}
+            for tensor, dims in node_tensors:
+                if tensor.name in outputs:
+                    unindexed[tensor.name] = frozenset(self.sub_workload.get_dims(cn)) - dims
             for core in cores_per_node.get(cn, []):
                 core_cap[core.id] = core.get_memory_capacity()
                 bucket = core_tensors.setdefault(core.id, [])
@@ -83,6 +89,7 @@ class CapacityTiler:
 
         # Per candidate dim: per-core size (full / inter-core unroll) and divisor tile sizes.
         all_dims: set[LayerDim] = {d for ts in core_tensors.values() for entry in ts for d in entry[1]}
+        output_dims = {d for ts in core_tensors.values() for t, dims in ts if t.name in unindexed for d in dims}
         per_core: dict[LayerDim, int] = {}
         divisors: dict[LayerDim, list[int]] = {}
         for dim in sorted(all_dims - protected, key=lambda d: d.position):
@@ -96,29 +103,43 @@ class CapacityTiler:
         seeded = self._seed_resident(cns, seed_tiling or [], per_core)
         resident: dict[LayerDim, int] = {dim: seeded.get(dim, per_core[dim]) for dim in per_core}
 
-        # Per core, each resident tensor as (base bits, scaling dims) so overflow() is cheap arithmetic.
-        base_of: dict[str, tuple[float, tuple[LayerDim, ...]]] = {}
-        core_terms: dict[int, list[tuple[float, tuple[LayerDim, ...]]]] = {}
+        # Per core, each resident tensor as (base bits, scaling dims, dims it is held across) so overflow() is
+        # cheap arithmetic.
+        Term = tuple[float, tuple[LayerDim, ...], tuple[LayerDim, ...]]
+        base_of: dict[str, Term] = {}
+        core_terms: dict[int, list[Term]] = {}
         for cid, tensors in core_tensors.items():
-            terms: list[tuple[float, tuple[LayerDim, ...]]] = []
+            terms: list[Term] = []
             for t, dims in tensors:
                 cached = base_of.get(t.name)
                 if cached is None:
                     full_bits = math.prod(t.shape) * t.operand_type.bitwidth
                     split = math.prod(unroll[d] for d in dims if unroll.get(d, 1) > 1)
-                    cached = (full_bits / split, tuple(d for d in dims if d in per_core))
+                    held = unindexed.get(t.name, frozenset())
+                    cached = (
+                        full_bits / split,
+                        tuple(d for d in dims if d in per_core),
+                        tuple(d for d in held if d in per_core),
+                    )
                     base_of[t.name] = cached
                 terms.append(cached)
             core_terms[cid] = terms
+
+        # The emitted loop nest, innermost first. Outputs are never spilled as partial sums, so dims indexing
+        # no output (reductions) go innermost, else an output stays resident across the outer loops.
+        loops = sorted(per_core, key=lambda d: (d in output_dims, d.position))
+        loop_pos = {d: i for i, d in enumerate(loops)}
+
+        def footprint(base: float, idx: tuple[LayerDim, ...], held: tuple[LayerDim, ...]) -> float:
+            """An output is held across its outermost tiled unindexed loop, so the loops inside it count whole."""
+            cut = max((loop_pos[d] for d in held if resident[d] < per_core[d]), default=-1)
+            return base * math.prod(resident[d] / per_core[d] for d in idx if loop_pos[d] > cut)
 
         def overflow() -> float:
             """Largest amount by which any core exceeds its budget (<= 0 means the whole group fits)."""
             return max(
                 (
-                    sum(
-                        base * math.prod(resident[d] / per_core[d] for d in idx) if idx else base
-                        for base, idx in core_terms[cid]
-                    )
+                    sum(footprint(*term) for term in core_terms[cid])
                     - budgets[cid]
                     for cid in core_cap
                     if budgets[cid] > 0
@@ -153,7 +174,7 @@ class CapacityTiler:
         if overflow() > 0:
             return []
 
-        return self._emit(cns, resident, per_core)
+        return self._emit(cns, {d: resident[d] for d in loops}, per_core)
 
     def _node_tensors(self, cn: ComputationNode) -> list[tuple[Tensor, frozenset[LayerDim]]]:
         """One node's own operands, each with the global dims that index it."""
