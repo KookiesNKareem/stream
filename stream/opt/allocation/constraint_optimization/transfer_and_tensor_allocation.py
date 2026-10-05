@@ -1713,6 +1713,14 @@ class TransferAndTensorAllocator:
         ]
         return self.model.quicksum(t._raw for t in terms) if terms else None
 
+    def _link_busy_value(self, link: CommunicationLink) -> float:
+        """Solved cycles this link carries data in one iteration."""
+        return sum(
+            float(self._active_transfer_latency(tr, choice, y).X)
+            for (tr, choice), y in self.y_path_choice.items()
+            if link in self.links_in_choice[(tr, choice)]
+        )
+
     def _offchip_bandwidth(self) -> float:
         """Bits per cycle the array can move across the off-chip boundary."""
         off = self.offchip_core_id
@@ -3056,6 +3064,9 @@ class TransferAndTensorAllocator:
         per_iteration = max(per_iteration, float(self.recurrence_bound or 0))
         for busy in self.shared_busy.values():
             per_iteration = max(per_iteration, float(busy.X))
+        for link in self.link_set:
+            if self._bounds_overlap(link):
+                per_iteration = max(per_iteration, self._link_busy_value(link))
         chain = sum(float(v.X) for v in self.slot_latency.values())
         return self.iterations * per_iteration + max(0.0, chain - per_iteration) + float(self.fill.X)
 
