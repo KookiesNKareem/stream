@@ -191,9 +191,8 @@ class ZigZagCostEstimator:
 
     @staticmethod
     def _per_core_size(full_size: int, factor: int) -> int:
-        """Per-core tile size: divide the full dimension size by its inter-core split factor when it
-        divides evenly; otherwise leave it unchanged (never produce a 0 or partial dimension size)."""
-        return full_size // factor if factor > 1 and full_size % factor == 0 else full_size
+        """Per-core tile size of the busiest core: an uneven split leaves the last core a partial tile."""
+        return -(-full_size // factor)
 
     def create_layer_dim_sizes(self, node: ComputationNode) -> ZigZagLayerDimSizes:
         dims = self.workload.get_dims(node)

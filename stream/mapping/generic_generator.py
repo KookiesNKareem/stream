@@ -10,6 +10,7 @@ All generated mapping dicts are validated via MappingValidator before being
 written to disk.  A ValueError is raised if validation fails.
 """
 
+import functools
 import logging
 import math
 import os
@@ -21,7 +22,7 @@ import yaml
 from stream.datatypes import LayerDim
 from stream.hardware.architecture.accelerator import Accelerator
 from stream.hardware.architecture.core import Core
-from stream.mapping.capacity_tiler import CapacityTiler
+from stream.mapping.capacity_tiler import CapacityTiler, per_core_tiles
 from stream.parser.mapping_validator import MappingValidator
 from stream.workload.affine_access import map_dim_positions
 from stream.workload.iterator_type import (
@@ -248,8 +249,8 @@ class GenericMappingGenerator:
         group largest-first, so a contraction only absorbs what the output axes could
         not: splitting a reduction leaves every core holding a partial sum that has to
         be reduced across the mesh. If ``n_cores`` cannot be fully factored over the
-        available dimensions, the largest achievable subset is returned (product of
-        factors < ``n_cores``) rather than forcing an indivisible split.
+        available dimensions, the split may leave the last core along a dimension a
+        partial tile (see ``_uneven_split``) rather than idle the cores no exact factor reaches.
 
         ``protected`` are global dimensions that must never be inter-core split (a SEQUENTIAL
         recurrence carry, or a nonlinear normalization reduction) for any node in the fused group.
@@ -280,7 +281,23 @@ class GenericMappingGenerator:
             if factor > 1:
                 split_factors.append((dim_idx, factor))
                 remaining //= factor
-        return split_factors
+        if remaining == 1:
+            return split_factors
+        caller_tiles = self._caller_tiles(sub_workload)
+        candidates = tuple(
+            (idx, size, types.get(idx) != IteratorType.PARALLEL, caller_tiles.get(dims[idx])) for idx, size in dim_sizes
+        )
+        return list(_uneven_split(candidates, n_cores))
+
+    def _caller_tiles(self, sub_workload: Workload) -> dict[LayerDim, int]:
+        """Per global dim, the tile the caller-supplied intra-core tiling gives it."""
+        nodes = {cn.name: cn for cn in sub_workload.get_computation_nodes()}
+        tiles: dict[LayerDim, int] = {}
+        for entry in self.intra_core_tiling or ():
+            name, _, pos = str(entry["dim"]).partition(".D")
+            if name in nodes and pos.isdigit() and int(pos) < len(node_dims := sub_workload.get_dims(nodes[name])):
+                tiles[node_dims[int(pos)]] = int(entry["tile"])
+        return tiles
 
     def _global_dims_at(
         self,
@@ -388,7 +405,7 @@ class GenericMappingGenerator:
             if dims:
                 dim_size = sub_workload.get_dimension_size(dims[0])
                 factor = unroll.get(dims[0], 1)
-                tile = dim_size // factor if factor > 1 and dim_size % factor == 0 else dim_size
+                tile = -(-dim_size // factor)
                 return [{"dim": f"{ref_cn.name}.D0", "tile": tile}]
         return []
 
@@ -413,7 +430,7 @@ class GenericMappingGenerator:
                 tile = self._tile_of(sub, tuple(cns), fusion_dim, tiling) or size
                 recurrence = fusion_dim in self._recurrence_dims(sub, tuple(cns))
                 streamed_axis = {"name": str(fusion_dim), "size": size}
-                factor = size // tile if tile else 1
+                factor = -(-size // tile) if tile else 1
                 buffer_elements = max(
                     (
                         math.prod(sub.get_tensor_shape_with_tiling(t, [(fusion_dim, factor)]))
@@ -552,7 +569,7 @@ class GenericMappingGenerator:
         if not streamed:
             return []
         unroll = self._inter_core_unrolling(sub_workload, cns).get(fusion_dim, 1)
-        per_core = full // unroll if unroll > 1 and full % unroll == 0 else full
+        tiles = per_core_tiles(full, unroll)
         capacity_bits = min(
             (cores[0].get_memory_capacity() for cn in cns if (cores := self._select_cores_for_node(cn))),
             default=0,
@@ -560,16 +577,15 @@ class GenericMappingGenerator:
         budget = capacity_bits // 2  # the fusion intermediate shares L1 with weights + activations
 
         def resident_bits(tile: int) -> int:
-            factor = full // tile
+            factor = -(-full // tile)
             return max(
                 _tensor_bits(sub_workload.get_tensor_shape_with_tiling(t, [(fusion_dim, factor)]), t) for t in streamed
             )
 
         # Only tile when the whole per-core slice does not fit (the layer-fusion trigger).
-        if budget <= 0 or resident_bits(per_core) <= budget:
+        if budget <= 0 or resident_bits(tiles[0]) <= budget:
             return []
-        divisors = sorted((t for t in range(1, per_core + 1) if per_core % t == 0), reverse=True)
-        tile = next((t for t in divisors if resident_bits(t) <= budget), None)
+        tile = next((t for t in tiles if resident_bits(t) <= budget), None)
         if tile is None:
             return []
         for cn in cns:
@@ -577,3 +593,40 @@ class GenericMappingGenerator:
             if fusion_dim in dims:
                 return [{"dim": f"{cn.name}.D{dims.index(fusion_dim)}", "tile": tile}]
         return []
+
+
+@functools.cache
+def _uneven_split(dims: tuple[tuple[int, int, bool, int | None], ...], n_cores: int) -> tuple[tuple[int, int], ...]:
+    """Factors over ``(index, size, is_reduction, caller_tile)`` dims, product <= ``n_cores``, that
+    minimize the busiest core's work.
+
+    A factor that does not divide its dimension leaves the last core a partial tile (as a GPU's last
+    wave of thread blocks), so each core computes ``prod(ceil(size / factor))`` points. A dim with a
+    caller tile only takes factors that hand every core whole tiles. Ties go to fewer cores, then to
+    less reduction split.
+    """
+    best: tuple[tuple[int, int, int], tuple[tuple[int, int], ...]] | None = None
+
+    def search(i: int, cores: int, work: int, reduction: int, chosen: tuple[tuple[int, int], ...]) -> None:
+        nonlocal best
+        if i == len(dims):
+            key = (work, cores, reduction)
+            if best is None or key < best[0]:
+                best = (key, chosen)
+            return
+        dim_idx, size, is_reduction, caller_tile = dims[i]
+        for factor in range(1, min(size, n_cores // cores) + 1):
+            tile = -(-size // factor)
+            if factor > 1 and (tile == -(-size // (factor - 1)) or (caller_tile and size % (caller_tile * factor))):
+                continue
+            search(
+                i + 1,
+                cores * factor,
+                work * tile,
+                reduction * factor if is_reduction else reduction,
+                (*chosen, (dim_idx, factor)) if factor > 1 else chosen,
+            )
+
+    search(0, 1, 1, 1, ())
+    assert best is not None
+    return best[1]

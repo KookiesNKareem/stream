@@ -4,6 +4,7 @@ The two-conv workload is used as a fast single-group proxy (< 60s).
 The Conv-Relu-Flatten-Gemm workload tests multi-group pipeline mechanics.
 """
 
+import math
 import tempfile
 
 import pytest
@@ -20,7 +21,7 @@ from stream.inputs.testing.workload.make_resnet_subgraph import (
     ResNetSubgraphConfig,
     make_resnet_subgraph,
 )
-from stream.mapping.generic_generator import GenericMappingGenerator
+from stream.mapping.generic_generator import GenericMappingGenerator, _uneven_split
 from stream.parser.mapping_validator import MappingValidator
 from stream.stages.context import StageContext
 from stream.stages.parsing.accelerator_parser import AcceleratorParserStage
@@ -232,3 +233,45 @@ def test_pool_ops_saturate_the_vpus_on_tpu_v7():
             assert cores_used == len(vpu_ids), (
                 f"{layer['name']} inter-core split {split} uses {cores_used} cores, expected {len(vpu_ids)}"
             )
+
+
+def test_uneven_split_uses_every_core():
+    """12 cores on a 4096^3 matmul: no dim is divisible by 3, so an exact split reaches at most 8 cores.
+    The last core along one output axis takes a partial tile instead, leaving the contraction whole."""
+    dims = ((0, 4096, False, None), (1, 4096, False, None), (2, 4096, True, None))
+    split = dict(_uneven_split(dims, 12))
+    assert math.prod(split.values()) == 12
+    assert 2 not in split
+    assert math.prod(-(-4096 // split.get(i, 1)) for i in range(3)) == 1024 * 1366 * 4096
+
+
+def test_uneven_split_keeps_caller_tiles_whole():
+    """A dim the caller tiles by 16 only takes factors that hand each core whole tiles."""
+    split = dict(_uneven_split(((0, 256, False, 16),), 32))
+    assert split == {0: 16}
+
+
+def test_uneven_inter_core_split_end_to_end():
+    """Odd conv dims share no factor with a 4-core mesh: every layer is still split over all four
+    cores (the last one taking a partial tile) and the pipeline prices it."""
+    config = TwoConvWorkloadConfig(
+        batch_size=1,
+        in_channels=3,
+        height=15,
+        width=15,
+        out_channels_1=5,
+        out_channels_2=7,
+        kernel_size=3,
+        in_dtype="bf16",
+        weight_dtype="bf16",
+    )
+    workload_path = make_2_conv_workload(config)
+    accelerator, workload = _parse_workload_and_accelerator(workload_path)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        paths, _ = GenericMappingGenerator(accelerator, workload, tmpdir).generate_all_groups()
+        for path in paths:
+            with open(path) as f:
+                data = yaml.safe_load(f)
+            for layer in data["layers"]:
+                assert math.prod(entry["split"] for entry in layer["inter_core_tiling"][0]) == 4, layer
+        assert evaluate_mapping(_ACCELERATOR, workload_path, tmpdir).cycles > 0

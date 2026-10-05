@@ -31,6 +31,21 @@ def _divisors_desc(n: int) -> list[int]:
     return sorted(small + large, reverse=True)
 
 
+def per_core_tiles(full: int, unroll: int) -> list[int]:
+    """Per-core tile sizes, largest first, that step a dim of size ``full`` split over ``unroll`` cores.
+
+    An uneven split hands the busiest core ``ceil(full / (steps * unroll))`` points per step, so its
+    tiles are those ceilings over the step counts that divide ``full`` (the temporal split stays exact).
+    """
+    if full % unroll == 0:
+        return _divisors_desc(full // unroll)
+    tiles = {-(-full // (steps * unroll)) for steps in _divisors_desc(full)}
+    return sorted(
+        (t for t in tiles if full % (steps := -(-full // (t * unroll))) == 0 and -(-full // (steps * unroll)) == t),
+        reverse=True,
+    )
+
+
 class CapacityTiler:
     """Choose per-core intra-core tiles so every compute core's resident footprint fits its operand buffer."""
 
@@ -73,10 +88,10 @@ class CapacityTiler:
         for dim in all_dims - protected:
             full = self.sub_workload.get_dimension_size(dim)
             u = unroll.get(dim, 1)
-            size = full // u if u > 1 and full % u == 0 else full
-            if size > 1:
-                per_core[dim] = size
-                divisors[dim] = _divisors_desc(size)
+            tiles = per_core_tiles(full, u)
+            if tiles[0] > 1:
+                per_core[dim] = tiles[0]
+                divisors[dim] = tiles
 
         seeded = self._seed_resident(cns, seed_tiling or [], per_core)
         resident: dict[LayerDim, int] = {dim: seeded.get(dim, per_core[dim]) for dim in per_core}
