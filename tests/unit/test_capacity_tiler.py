@@ -1,6 +1,9 @@
 """The capacity-aware intra-core tiler streams a resident weight on overflow, leaves fitting groups alone."""
 
 import math
+import os
+import subprocess
+import sys
 import tempfile
 
 import pytest
@@ -147,6 +150,30 @@ def test_refined_mapping_validates():
 
         data = yaml.safe_load(open(path))
         assert MappingValidator(data).validate(), MappingValidator(data).errors
+
+
+def test_mapping_independent_of_hash_seed():
+    """Tied dims are ordered by position, not by their seed-dependent hash, so every process maps alike."""
+    script = (
+        "import tempfile, sys\n"
+        f"sys.path.insert(0, {os.path.dirname(__file__)!r})\n"
+        "from test_capacity_tiler import _SWIGLU_FITS, _TPU_QUAD, _parse\n"
+        "from stream.mapping.generic_generator import GenericMappingGenerator\n"
+        "acc, w = _parse(_TPU_QUAD, _SWIGLU_FITS)\n"
+        "for path in GenericMappingGenerator(acc, w, tempfile.mkdtemp()).generate_all_groups()[0]:\n"
+        "    print(open(path).read())\n"
+    )
+    mappings = {
+        subprocess.run(
+            [sys.executable, "-c", script],
+            env={**os.environ, "PYTHONHASHSEED": seed},
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+        for seed in ("0", "1")
+    }
+    assert len(mappings) == 1
 
 
 if __name__ == "__main__":

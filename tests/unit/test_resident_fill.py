@@ -38,6 +38,7 @@ def _fill(*, rotating: bool, single: bool = False) -> float:
     allocator.shared_bandwidth = {0: SimpleNamespace(ceiling=1.0)}
     cycles = {}
     allocator.y_path_choice, allocator.z_stop, allocator.z_single = {}, {}, {}
+    allocator.path_choice_name = {}
     allocator.tensors_to_optimize_reuse_for, allocator.ssis = [], {}
     allocator.rotation_levels, allocator.tiles_needed_levels = {}, {}
     for name, cost in (("key", KEY), ("value", VALUE)):
@@ -49,6 +50,7 @@ def _fill(*, rotating: bool, single: bool = False) -> float:
         model.add_constr(y == 1)
         model.add_constr(z == 1)
         allocator.y_path_choice[(transfer, "path")] = y
+        allocator.path_choice_name[(transfer, "path")] = f"{transfer.name}_choice_0"
         allocator.z_stop[(tensor, 0)] = z
         allocator.z_stop[(tensor, 1)] = outer = model.add_var(vtype=SolverVarType.BINARY, name=f"z1_{name}")
         model.add_constr(outer == 0)

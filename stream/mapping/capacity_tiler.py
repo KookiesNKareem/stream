@@ -85,7 +85,7 @@ class CapacityTiler:
         all_dims: set[LayerDim] = {d for ts in core_tensors.values() for entry in ts for d in entry[1]}
         per_core: dict[LayerDim, int] = {}
         divisors: dict[LayerDim, list[int]] = {}
-        for dim in all_dims - protected:
+        for dim in sorted(all_dims - protected, key=lambda d: d.position):
             full = self.sub_workload.get_dimension_size(dim)
             u = unroll.get(dim, 1)
             tiles = per_core_tiles(full, u)
