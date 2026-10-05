@@ -5,7 +5,7 @@ import tempfile
 
 import pytest
 
-from stream.mapping.capacity_tiler import CapacityTiler, _divisors_desc
+from stream.mapping.capacity_tiler import CapacityTiler, _divisors_desc, per_core_tiles
 from stream.mapping.generic_generator import GenericMappingGenerator
 from stream.parser.mapping_validator import MappingValidator
 from stream.stages.context import StageContext
@@ -151,3 +151,9 @@ def test_refined_mapping_validates():
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+def test_per_core_tiles_of_an_uneven_split():
+    """4096 over 3 cores: each temporal step that divides 4096 hands the busiest core a ceiling tile."""
+    assert per_core_tiles(4096, 3)[:4] == [1366, 683, 342, 171]
+    assert per_core_tiles(4096, 4) == [1024, 512, 256, 128, 64, 32, 16, 8, 4, 2, 1]

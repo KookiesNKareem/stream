@@ -50,10 +50,10 @@ def determine_fusion_splits(workload: "Workload", mapping: "Mapping") -> dict[La
     result = {}
     for dim, tile_size in fused_group.intra_core_tiling:
         # assert dim in max_dims, f"Fused group intra_core_tiling dimension {dim} not present for all layers."
-        nb_splits, rem = divmod(workload.get_dimension_size(dim), int(tile_size * unique_unrollings_dict.get(dim, 1)))
-        assert rem == 0, (
-            f"Dimension size {workload.get_dimension_size(dim)} not divisible by "
-            f"desired tile size {tile_size * unique_unrollings_dict.get(dim, 1)}"
+        size, unrolling = workload.get_dimension_size(dim), unique_unrollings_dict.get(dim, 1)
+        nb_splits = -(-size // (tile_size * unrolling))
+        assert size % nb_splits == 0 and -(-size // (nb_splits * unrolling)) == tile_size, (
+            f"Dimension size {size} split over {unrolling} cores cannot be tiled into tiles of {tile_size}"
         )
         # Tiling a nonlinear (softmax/layernorm) reduction into blocks needs the online-softmax rewrite.
         if nb_splits > 1 and dim in protected:
@@ -147,8 +147,8 @@ def _insert_kernel_iteration_variables(
         for dim in reversed(unique_dims):
             spatial_unrolling = next((su[1] for su in unique_spatial_unrollings if su[0] == dim), 1)
             dim_size = workload.get_dimension_size(dim)
-            size, rem = divmod(dim_size, spatial_unrolling)
-            assert rem == 0, f"Dim size {dim_size} not divisible by spatial unrolling {spatial_unrolling}"
+            # An uneven split pads the last core's tile; the busiest core sets the kernel size.
+            size = -(-dim_size // spatial_unrolling)
             effect = LoopEffect.VARYING if dim in workload.get_dims(node) else LoopEffect.INVARIANT
             iteration_variables[node].insert(
                 0,
