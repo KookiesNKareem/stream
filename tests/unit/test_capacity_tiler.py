@@ -6,8 +6,12 @@ import subprocess
 import sys
 import tempfile
 
+import onnx
 import pytest
+from onnx import TensorProto, helper
 
+from stream.api import SolveOptions, evaluate_mapping
+from stream.ir.infeasibility import InfeasibleAllocationError
 from stream.mapping.capacity_tiler import CapacityTiler, _divisors_desc, per_core_tiles
 from stream.mapping.generic_generator import GenericMappingGenerator
 from stream.parser.mapping_validator import MappingValidator
@@ -184,3 +188,43 @@ def test_per_core_tiles_of_an_uneven_split():
     """4096 over 3 cores: each temporal step that divides 4096 hands the busiest core a ceiling tile."""
     assert per_core_tiles(4096, 3)[:4] == [1366, 683, 342, 171]
     assert per_core_tiles(4096, 4) == [1024, 512, 256, 128, 64, 32, 16, 8, 4, 2, 1]
+
+
+def _matmul(m: int, n: int, k: int) -> str:
+    """An ONNX MatMul, which Stream lays out as (m, n, k): its contraction is D2, not a Gemm's D1."""
+    w = TensorProto(name="W", data_type=TensorProto.BFLOAT16, dims=[k, n])
+    graph = helper.make_graph(
+        [helper.make_node("MatMul", ["X", "W"], ["Y"], name="MatMul")],
+        "matmul",
+        [helper.make_tensor_value_info("X", TensorProto.BFLOAT16, [m, k])],
+        [helper.make_tensor_value_info("Y", TensorProto.BFLOAT16, [m, n])],
+        initializer=[w],
+    )
+    path = os.path.join(tempfile.mkdtemp(), f"matmul_{m}_{n}_{k}.onnx")
+    onnx.save(helper.make_model(graph, opset_imports=[helper.make_opsetid("", 17)]), path)
+    return path
+
+
+def test_reduction_loop_is_innermost_whatever_its_position():
+    """With the contraction outside the N loop the pinned output tile would span all of N and overflow;
+    the tiler nests the contraction (D2 here) innermost, so the allocation fits."""
+    workload = _matmul(256, 8192, 8192)
+    acc, w = _parse(_TPU_QUAD, workload)
+    gen = GenericMappingGenerator(acc, w, tempfile.mkdtemp())
+    (sub,) = w.split_fusion_groups(cut_points=gen._cut_points(None))
+    cns = tuple(sub.get_computation_nodes())
+    refined = gen._capacity_refine(sub, cns, gen._whole_layer_tiling(sub, cns))
+    assert [e["dim"] for e in refined] == ["MatMul.D2", "MatMul.D1"]
+    assert evaluate_mapping(_TPU_QUAD, workload, tempfile.mkdtemp()).cycles > 0
+
+
+def test_pinned_output_overflow_is_diagnosed_as_capacity():
+    """The same MatMul forced into the reduction-outer order is reported as the pinned output's memory overflow."""
+    tiling = [{"dim": "MatMul.D1", "tile": 512}, {"dim": "MatMul.D2", "tile": 512}]
+    options = SolveOptions(stage_options={"intra_core_tiling": tiling})
+    with pytest.raises(InfeasibleAllocationError) as info:
+        evaluate_mapping(_TPU_QUAD, _matmul(256, 8192, 8192), tempfile.mkdtemp(), options=options)
+    report = info.value.report
+    assert report.nature == "capacity"
+    details = [t.detail for r in report.resources if r.unmet for t in r.unmet.terms]
+    assert "pinned resident across its unindexed loops" in details, report.summary
